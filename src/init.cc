@@ -1301,6 +1301,44 @@ cleanup:
   return res;
 }
 
+static bool sfantao_is_init = false;
+static pthread_t sfantao_tid;
+static hipStream_t sfantao_stream = 0;
+static int sfantao_wait_time = 1000;
+static float *sfantao_rfp32_1 = nullptr, *sfantao_rfp32_2 = nullptr;
+static ncclComm_t sfantao_comm = nullptr;
+static bool sfantao_continue = false;
+
+static void* sfantao_poll(void *arg)
+{
+  int i=0;
+  while(sfantao_continue) {
+  
+    if (i%2048) {
+      printf("\nsfantao --> polling thread is making progress [%p][%p][%p][%p]...\n",sfantao_rfp32_1,sfantao_rfp32_2,sfantao_comm,sfantao_stream);
+    }
+  
+    if(i%2) {
+      ncclGroupStart();
+      ncclAllReduce(sfantao_rfp32_1, sfantao_rfp32_2, 1, ncclFloat32, ncclSum, sfantao_comm, sfantao_stream);
+      ncclGroupEnd();
+
+    } else {
+      ncclGroupStart();
+      ncclAllReduce(sfantao_rfp32_2, sfantao_rfp32_1, 1, ncclFloat32, ncclSum, sfantao_comm, sfantao_stream);
+      ncclGroupEnd();
+
+    }
+    
+    CUDACHECKRETNULL(hipStreamSynchronize(sfantao_stream));
+    
+    ++i;
+    usleep(sfantao_wait_time);
+  }
+
+  return nullptr;
+}
+
 static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank, int cudaDev, int virtualId) {
   ncclResult_t res;
   char* env = getenv("NCCL_COMM_ID");
@@ -1330,8 +1368,43 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
   }
 
 end:
-  if (ncclAsyncMode()) return ncclAsyncErrCheck(res);
-  else return res;
+
+  ncclResult_t res2;
+  if (ncclAsyncMode()) res2 = ncclAsyncErrCheck(res);
+  else res2 = res;
+  
+  // sfantao
+  if (!sfantao_is_init){
+    sfantao_is_init = true;
+    
+    assert(sfantao_comm == nullptr && "Polling comm exists.");
+    
+    int leastPriority, greatestPriority;
+    CUDACHECK(hipDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+    CUDACHECK(hipStreamCreateWithPriority(&sfantao_stream,hipStreamNonBlocking,leastPriority));
+    
+    if(const char* env_p = std::getenv("NCCL_SFANTAO_POLL_WAIT_TIME"))
+      sfantao_wait_time = atoi(env_p);
+      
+    assert(sfantao_rfp32_1 == nullptr && sfantao_rfp32_2 == nullptr && "Polling is being duplicated");
+    
+    CUDACHECK(hipMalloc(&sfantao_rfp32_1, sizeof(float)));
+    CUDACHECK(hipMalloc(&sfantao_rfp32_2, sizeof(float)));  
+
+    //NCCLCHECK(ncclCommInitRankDev(&sfantao_comm, nranks, commId, myrank, cudaDev, virtualId));
+    sfantao_comm=*newcomm;
+    sfantao_continue = true;
+    
+    printf("\nsfantao --> about to create poling thread [%p][%p][%p][%p]...\n",sfantao_rfp32_1,sfantao_rfp32_2,sfantao_comm,sfantao_stream);
+    auto err = pthread_create(&sfantao_tid, NULL, &sfantao_poll, NULL);
+    if (err != 0)
+      printf("\nsfantao --> can't create polling thread :[%s]", strerror(err));
+    else
+      printf("\nsfantao --> polling thread created successfully\n");
+      
+  }
+  
+  return res2;
 }
 
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
@@ -1442,6 +1515,24 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
   NVTX3_FUNC_RANGE_IN(nccl_domain);
   if (comm == NULL)
     return ncclSuccess;
+    
+  // stop polling
+  if (sfantao_comm) {
+    // signal termination and wait for thread.
+    sfantao_continue = false;
+    pthread_join(sfantao_tid, NULL);
+    
+    
+    auto sfantao_comm_remove = sfantao_comm;
+    sfantao_comm = nullptr;
+    //NCCLCHECK(ncclCommDestroy(sfantao_comm_remove));
+    
+    CUDACHECK(hipFree(sfantao_rfp32_1));
+    CUDACHECK(hipFree(sfantao_rfp32_2)); 
+    sfantao_rfp32_1 = sfantao_rfp32_2 = nullptr;
+    CUDACHECK(hipStreamDestroy(sfantao_stream));
+    
+  }
 
   int rank = comm->rank, nranks = comm->nRanks, cudaDev = comm->cudaDev;
   int64_t busId = comm->busId;

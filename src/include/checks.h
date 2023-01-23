@@ -19,6 +19,14 @@
     }                                                       \
 } while(false)
 
+#define CUDACHECKRETNULL(cmd) do {                                 \
+    hipError_t err = cmd;                                    \
+    if( err != hipSuccess ) {                                \
+        WARN("HIP failure '%s'", hipGetErrorString(err));   \
+        return nullptr;                      \
+    }                                                       \
+} while(false)
+
 #define CUDACHECKGOTO(cmd, res, label) do {                 \
     hipError_t err = cmd;                                    \
     if( err != hipSuccess ) {                                \
